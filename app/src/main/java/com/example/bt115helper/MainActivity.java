@@ -2,7 +2,6 @@ package com.example.bt115helper;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -33,7 +32,7 @@ public class MainActivity extends Activity {
         @Override public void run() {
             SharedPreferences prefs = getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE);
             statusView.setText(prefs.getString(BluetoothWorkerService.KEY_STATUS,
-                    "جاهز. اضغط «ابدأ الآن» للبدء."));
+                    "جاهز. اضغط «ابدأ الآن» لمنح الأذونات وبدء البحث."));
             handler.postDelayed(this, 1500);
         }
     };
@@ -44,8 +43,12 @@ public class MainActivity extends Activity {
         setContentView(createContent());
         SharedPreferences prefs = getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE);
         bootCheck.setChecked(prefs.getBoolean(BluetoothWorkerService.KEY_BOOT, false));
-        bootCheck.setOnCheckedChangeListener((button, checked) ->
-                prefs.edit().putBoolean(BluetoothWorkerService.KEY_BOOT, checked).apply());
+        bootCheck.setOnCheckedChangeListener((button, checked) -> {
+            prefs.edit().putBoolean(BluetoothWorkerService.KEY_BOOT, checked).apply();
+            setStatus(checked
+                    ? "تم حفظ خيار بدء المراقبة بعد الإقلاع. يجب منح أذونات Bluetooth أولًا؛ وقد يمنع نظام الجهاز التشغيل التلقائي."
+                    : "تم إيقاف خيار بدء المراقبة بعد الإقلاع.");
+        });
         handler.post(refreshStatus);
     }
 
@@ -75,7 +78,7 @@ public class MainActivity extends Activity {
         page.addView(title, matchWrap());
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("أداة Bluetooth محلية لأجهزة Android TV");
+        subtitle.setText("بحث دوري عن أجهزة Bluetooth التي يتضمن اسمها BT115");
         subtitle.setTextColor(Color.rgb(176, 194, 219));
         subtitle.setTextSize(17);
         subtitle.setGravity(Gravity.CENTER);
@@ -89,18 +92,18 @@ public class MainActivity extends Activity {
         start.setAllCaps(false);
         start.setTextColor(Color.WHITE);
         start.setBackground(background(Color.rgb(24, 111, 224), dp(12)));
-        start.setOnClickListener(v -> showSafetyConfirmation());
+        start.setOnClickListener(v -> ensureBluetoothPermissions());
         LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(dp(300), dp(62));
         startParams.topMargin = dp(27);
         page.addView(start, startParams);
 
         bootCheck = new CheckBox(this);
-        bootCheck.setText("البدء مع تشغيل النظام");
+        bootCheck.setText("بدء البحث مع تشغيل النظام");
         bootCheck.setTextColor(Color.WHITE);
         bootCheck.setTextSize(17);
         bootCheck.setButtonTintList(android.content.res.ColorStateList.valueOf(Color.rgb(87, 169, 255)));
         bootCheck.setPadding(dp(10), dp(5), dp(10), dp(5));
-        LinearLayout.LayoutParams checkParams = new LinearLayout.LayoutParams(dp(340), dp(58));
+        LinearLayout.LayoutParams checkParams = new LinearLayout.LayoutParams(dp(370), dp(58));
         checkParams.topMargin = dp(12);
         page.addView(bootCheck, checkParams);
 
@@ -124,7 +127,7 @@ public class MainActivity extends Activity {
         page.addView(statusView, statusParams);
 
         TextView notice = new TextView(this);
-        notice.setText("لا يحتاج التطبيق إلى تطبيق وسيط، لكن تنفيذ أوامر النظام يتطلب أن يكون الجهاز مروّتًا مسبقًا وأن يسمح su لهذا التطبيق. على Android العادي سيرفض النظام الأوامر. مسح بيانات Bluetooth قد يحذف الاقترانات.");
+        notice.setText("يحاول التطبيق طلب الاقتران عند العثور على جهاز غير مقترن؛ قد يتطلب Android تأكيدًا أو PIN. بعد الاقتران يتولى Android إعادة الاتصال. لا يستطيع تطبيق عادي إبقاء جهاز مفصول ظاهرًا كأنه متصل أو إخفاء انقطاعه. قد يعرض Android إشعار خدمة مستمرة، وقد يقيّد نظام الشركة بدء التطبيق بعد الإقلاع.");
         notice.setTextColor(Color.rgb(242, 197, 105));
         notice.setTextSize(13);
         notice.setGravity(Gravity.CENTER);
@@ -133,15 +136,6 @@ public class MainActivity extends Activity {
         noticeParams.topMargin = dp(7);
         page.addView(notice, noticeParams);
         return scroll;
-    }
-
-    private void showSafetyConfirmation() {
-        new AlertDialog.Builder(this)
-                .setTitle("تأكيد تشغيل أوامر النظام")
-                .setMessage("سيحاول التطبيق تنفيذ الأوامر مباشرةً من داخله باستخدام su على جهاز مروّت: تعطيل Bluetooth ثم تفعيله ثم مسح بيانات com.android.bluetooth. قد يؤدي المسح إلى إزالة الاقترانات أو إعادة ضبط Bluetooth. على جهاز غير مروّت ستفشل هذه الأوامر. هل تريد المتابعة؟")
-                .setNegativeButton("إلغاء", null)
-                .setPositiveButton("متابعة", (dialog, which) -> ensureBluetoothPermissions())
-                .show();
     }
 
     private void ensureBluetoothPermissions() {
@@ -160,7 +154,18 @@ public class MainActivity extends Activity {
     private void startWorker() {
         Intent intent = new Intent(this, BluetoothWorkerService.class);
         intent.setAction(BluetoothWorkerService.ACTION_RUN_NOW);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent); else startService(intent);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent); else startService(intent);
+            setStatus("تم طلب بدء المراقبة.");
+        } catch (RuntimeException e) {
+            setStatus("منع Android بدء خدمة المراقبة في الخلفية: " + e.getClass().getSimpleName());
+        }
+    }
+
+    private void setStatus(String status) {
+        getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE)
+                .edit().putString(BluetoothWorkerService.KEY_STATUS, status).apply();
+        if (statusView != null) statusView.setText(status);
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
@@ -169,8 +174,8 @@ public class MainActivity extends Activity {
             startAfterPermission = false;
             if (grantResults.length < 2 || grantResults[0] != PackageManager.PERMISSION_GRANTED
                     || grantResults[1] != PackageManager.PERMISSION_GRANTED) {
-                getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE).edit()
-                        .putString(BluetoothWorkerService.KEY_STATUS, "لم تُمنح أذونات Bluetooth؛ ستُنفذ محاولة الأوامر فقط دون البحث عن الريموت.").apply();
+                setStatus("يلزم إذنا Bluetooth Scan وConnect لبدء البحث.");
+                return;
             }
             startWorker();
         }

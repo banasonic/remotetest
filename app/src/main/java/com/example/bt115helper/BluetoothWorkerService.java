@@ -13,21 +13,18 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 public class BluetoothWorkerService extends Service {
     public static final String PREFS = "bt115_prefs";
@@ -38,19 +35,20 @@ public class BluetoothWorkerService extends Service {
     private static final String TAG = "BT115Helper";
     private static final String CHANNEL_ID = "bt115_monitor";
     private static final int NOTIFICATION_ID = 115;
-    private static final String[] COMMANDS = {
-            "cmd bluetooth_manager disable",
-            "cmd bluetooth_manager enable",
-            "pm clear com.android.bluetooth"
-    };
-    private static final Set<String> TARGET_NAMES = new HashSet<>(Arrays.asList(
-            "BT115-001", "BT115-002", "BT115-003"));
+    private static final long BOND_RETRY_DELAY_MS = 60_000L;
+    private static final long SCAN_RETRY_DELAY_MS = 1_000L;
+    private static final long SCAN_FALLBACK_DELAY_MS = 25_000L;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private final HandlerLoop scanLoop = new HandlerLoop();
-    private final Set<String> bondRequested = new HashSet<>();
-    private boolean busy;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Map<String, Long> bondRequestTimes = new HashMap<>();
+    private final Set<String> connectedTargetAddresses = new HashSet<>();
+    private final Set<String> bondingTargetAddresses = new HashSet<>();
     private BroadcastReceiver bluetoothReceiver;
+    private BluetoothAdapter adapter;
+    private boolean monitoring;
+
+    private final Runnable scanRunnable = this::startDiscovery;
 
     @Override public void onCreate() {
         super.onCreate();
@@ -59,102 +57,72 @@ public class BluetoothWorkerService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIFICATION_ID, buildNotification("يتم تشغيل الخدمة"));
-        if (busy) return START_STICKY;
-        busy = true;
-        String action = intent == null ? null : intent.getAction();
-        boolean runCommands = ACTION_RUN_NOW.equals(action) || ACTION_BOOT.equals(action);
-        worker.execute(() -> {
-            try {
-                if (runCommands) runRequestedSequence();
-                beginMonitoring();
-            } finally {
-                busy = false;
-            }
-        });
+        startForeground(NOTIFICATION_ID, buildNotification("بدء مراقبة أجهزة BT115"));
+        worker.execute(this::beginMonitoring);
         return START_STICKY;
-    }
-
-    private void runRequestedSequence() {
-        for (int i = 0; i < COMMANDS.length; i++) {
-            String command = COMMANDS[i];
-            updateStatus("تنفيذ مباشر عبر su " + (i + 1) + "/3: " + command);
-            CommandResult result = executeAsRoot(command);
-            Log.i(TAG, command + " => " + result.output);
-            if (result.success) {
-                updateStatus("نجح الأمر " + (i + 1) + "/3: " + command);
-            } else {
-                updateStatus("فشل الأمر " + (i + 1) + "/3 (exit " + result.exitCode + "): " + shortText(result.output));
-            }
-            try { Thread.sleep(i == 1 ? 3500 : 700); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
-        }
-    }
-
-    private CommandResult executeAsRoot(String command) {
-        Process process = null;
-        ExecutorService readerExecutor = Executors.newSingleThreadExecutor();
-        try {
-            process = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
-            final InputStream stream = process.getInputStream();
-            Future<String> outputFuture = readerExecutor.submit((Callable<String>) () -> {
-                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                byte[] buffer = new byte[2048];
-                int count;
-                while ((count = stream.read(buffer)) != -1) bytes.write(buffer, 0, count);
-                return new String(bytes.toByteArray(), StandardCharsets.UTF_8).trim();
-            });
-            if (!process.waitFor(20, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                return new CommandResult(false, 124, "انتهت مهلة الأمر بعد 20 ثانية");
-            }
-            String output = outputFuture.get(3, TimeUnit.SECONDS);
-            int exitCode = process.exitValue();
-            return new CommandResult(exitCode == 0, exitCode, output.isEmpty() ? "لا توجد مخرجات" : output);
-        } catch (Exception e) {
-            if (process != null) process.destroyForcibly();
-            return new CommandResult(false, 125,
-                    "تعذر تشغيل su أو لم يمنح الجهاز صلاحية root: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-        } finally {
-            readerExecutor.shutdownNow();
-        }
     }
 
     private void beginMonitoring() {
         if (!hasBluetoothPermissions()) {
-            updateStatus("لم تُمنح أذونات Bluetooth؛ لم يبدأ البحث عن الريموت.");
+            updateStatus("يلزم منح إذني Bluetooth Scan وConnect مرة واحدة من التطبيق قبل المراقبة.");
             return;
         }
-        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null) {
             updateStatus("هذا الجهاز لا يوفر Bluetooth عبر Android.");
             return;
         }
         try {
             if (!adapter.isEnabled()) {
-                updateStatus("Bluetooth غير مفعّل. راجع نتيجة أمر enable أعلاه.");
+                updateStatus("Bluetooth متوقف. شغّله من إعدادات Android ثم أعد بدء المراقبة.");
                 return;
             }
-            checkBondedDevices(adapter);
-            scanLoop.runScanCycle(adapter);
+            monitoring = true;
+            inspectBondedDevices();
+            updateStatus("المراقبة تعمل؛ البحث عن أي اسم جهاز يحتوي BT115.");
+            handler.removeCallbacks(scanRunnable);
+            handler.post(scanRunnable);
         } catch (SecurityException e) {
             updateStatus("رفض Android الوصول إلى Bluetooth: " + e.getMessage());
         }
     }
 
-    private void checkBondedDevices(BluetoothAdapter adapter) {
+    private void inspectBondedDevices() {
+        if (adapter == null || !hasBluetoothPermissions()) return;
         try {
             for (BluetoothDevice device : adapter.getBondedDevices()) {
                 String name = safeName(device);
-                if (isTarget(name)) updateStatus("الريموت " + name + " مقترن. حالة الاتصال الفعلية يحددها نظام Bluetooth.");
+                if (isTarget(name)) {
+                    int state = device.getBondState();
+                    updateStatus(state == BluetoothDevice.BOND_BONDED
+                            ? "الريموت " + name + " محفوظ كجهاز مقترن؛ سيتولى Android إعادة الاتصال عندما يصبح متاحًا."
+                            : "عُثر على سجل ريموت " + name + ".");
+                }
             }
-        } catch (SecurityException ignored) { }
+        } catch (SecurityException e) {
+            Log.w(TAG, "Cannot read bonded devices", e);
+        }
     }
 
     private void registerBluetoothReceiver() {
         bluetoothReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
                 String action = intent.getAction();
+                if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                    scheduleNextScan(SCAN_RETRY_DELAY_MS);
+                    return;
+                }
+                if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
+                    int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+                    if (state == BluetoothAdapter.STATE_ON && monitoring) {
+                        updateStatus("عاد Bluetooth للعمل؛ استئناف مراقبة BT115.");
+                        scheduleNextScan(0L);
+                    } else if (state == BluetoothAdapter.STATE_TURNING_OFF || state == BluetoothAdapter.STATE_OFF) {
+                        handler.removeCallbacks(scanRunnable);
+                        updateStatus("Bluetooth متوقف؛ ستُستأنف المراقبة عند تشغيله.");
+                    }
+                    return;
+                }
                 BluetoothDevice device;
                 try { device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE); }
                 catch (Exception e) { return; }
@@ -163,34 +131,118 @@ public class BluetoothWorkerService extends Service {
                 if (!isTarget(name)) return;
 
                 if (BluetoothDevice.ACTION_FOUND.equals(action)) {
-                    int bondState = device.getBondState();
-                    updateStatus("عُثر على " + name + (bondState == BluetoothDevice.BOND_BONDED ? " (مقترن)" : " (غير مقترن)"));
-                    if (bondState == BluetoothDevice.BOND_NONE && bondRequested.add(device.getAddress())) {
-                        try {
-                            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-                            if (adapter != null) adapter.cancelDiscovery();
-                            boolean requested = device.createBond();
-                            updateStatus(requested ? "طُلب الاقتران مع " + name + ". قد يعرض Android تأكيدًا على الشاشة." : "تعذر طلب الاقتران مع " + name);
-                        } catch (SecurityException e) {
-                            updateStatus("تعذر طلب الاقتران؛ تحقق من إذن Bluetooth.");
-                        }
-                    }
+                    onTargetFound(device, name);
                 } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
-                    updateStatus("تغيرت حالة اقتران " + name + ".");
+                    int state;
+                    try { state = device.getBondState(); }
+                    catch (SecurityException e) { return; }
+                    if (state == BluetoothDevice.BOND_BONDED) {
+                        bondingTargetAddresses.remove(device.getAddress());
+                        bondRequestTimes.remove(device.getAddress());
+                        updateStatus("اكتمل اقتران " + name + ". سيعيد Android الاتصال به تلقائيًا إذا كان الريموت متاحًا.");
+                        if (connectedTargetAddresses.isEmpty() && bondingTargetAddresses.isEmpty()) scheduleNextScan(1_000L);
+                    } else if (state == BluetoothDevice.BOND_NONE) {
+                        bondingTargetAddresses.remove(device.getAddress());
+                        updateStatus("لم يكتمل الاقتران مع " + name + "; قد يتطلب تأكيدًا أو PIN من Android.");
+                        if (connectedTargetAddresses.isEmpty() && bondingTargetAddresses.isEmpty()) scheduleNextScan(1_000L);
+                    } else {
+                        bondingTargetAddresses.add(device.getAddress());
+                        handler.removeCallbacks(scanRunnable);
+                        updateStatus("جارٍ الاقتران مع " + name + ".");
+                    }
                 } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
-                    updateStatus("أبلغ Android عن اتصال " + name + ".");
+                    connectedTargetAddresses.add(device.getAddress());
+                    handler.removeCallbacks(scanRunnable);
+                    try { if (adapter != null && adapter.isDiscovering()) adapter.cancelDiscovery(); }
+                    catch (SecurityException ignored) { }
+                    updateStatus("اتصال فعلي حسب Android: " + name + ". أُوقف البحث لتجنب إزعاج الاتصال؛ Android يدير إبقاءه وإعادة الاتصال.");
                 } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-                    updateStatus("أبلغ Android عن انقطاع " + name + "؛ سيواصل التطبيق البحث دون تزوير حالة الاتصال.");
+                    connectedTargetAddresses.remove(device.getAddress());
+                    updateStatus("أبلغ Android عن انقطاع " + name + "; يُمنح Android لحظة لمحاولة إعادة اتصال الريموت المقترن، ثم يستأنف البحث.");
+                    if (connectedTargetAddresses.isEmpty()) scheduleNextScan(SCAN_RETRY_DELAY_MS);
                 }
             }
         };
         IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+        filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         filter.addAction(BluetoothDevice.ACTION_FOUND);
         filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
         filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(bluetoothReceiver, filter);
+    }
+
+    private void onTargetFound(BluetoothDevice device, String name) {
+        try {
+            int bondState = device.getBondState();
+            if (bondState == BluetoothDevice.BOND_BONDED) {
+                updateStatus("عُثر على " + name + " وهو مقترن؛ Android يدير إعادة الاتصال.");
+                return;
+            }
+            updateStatus("عُثر على " + name + (bondState == BluetoothDevice.BOND_BONDING ? "؛ جارٍ الاقتران." : "؛ طلب الاقتران."));
+            if (bondState == BluetoothDevice.BOND_BONDING) {
+                bondingTargetAddresses.add(device.getAddress());
+                handler.removeCallbacks(scanRunnable);
+            } else if (bondState == BluetoothDevice.BOND_NONE) {
+                requestBondIfDue(device, name);
+            }
+        } catch (SecurityException e) {
+            updateStatus("تعذر قراءة الجهاز؛ تحقق من إذن Bluetooth Connect.");
+        }
+    }
+
+    private void requestBondIfDue(BluetoothDevice device, String name) {
+        long now = System.currentTimeMillis();
+        Long previous = bondRequestTimes.get(device.getAddress());
+        if (previous != null && now - previous < BOND_RETRY_DELAY_MS) return;
+        bondRequestTimes.put(device.getAddress(), now);
+        try {
+            if (adapter != null && adapter.isDiscovering()) adapter.cancelDiscovery();
+            boolean requested = device.createBond();
+            if (requested) {
+                bondingTargetAddresses.add(device.getAddress());
+                handler.removeCallbacks(scanRunnable);
+            }
+            updateStatus(requested
+                    ? "أُرسل طلب اقتران إلى " + name + ". قد يتطلب Android موافقة أو PIN."
+                    : "رفض Android طلب الاقتران مع " + name + "; ستتم إعادة المحاولة لاحقًا.");
+        } catch (SecurityException e) {
+            updateStatus("لا يملك التطبيق صلاحية طلب الاقتران مع " + name + ".");
+        }
+    }
+
+    private void startDiscovery() {
+        if (!monitoring || adapter == null) return;
+        if (!connectedTargetAddresses.isEmpty() || !bondingTargetAddresses.isEmpty()) return;
+        if (!hasBluetoothPermissions()) {
+            updateStatus("انتهى إذن Bluetooth؛ افتح التطبيق وامنح الأذونات مجددًا.");
+            return;
+        }
+        try {
+            if (!adapter.isEnabled()) {
+                updateStatus("Bluetooth متوقف؛ البحث متوقف حتى تشغيله من إعدادات النظام.");
+                scheduleNextScan(10_000L);
+                return;
+            }
+            boolean started = adapter.startDiscovery();
+            if (started) {
+                updateStatus("جارٍ البحث عن أي ريموت يتضمن اسمه BT115.");
+                handler.removeCallbacks(scanRunnable);
+                handler.postDelayed(scanRunnable, SCAN_FALLBACK_DELAY_MS);
+            } else {
+                scheduleNextScan(SCAN_RETRY_DELAY_MS);
+            }
+        } catch (SecurityException e) {
+            updateStatus("منع Android بدء بحث Bluetooth: " + e.getMessage());
+        }
+    }
+
+    private void scheduleNextScan(long delayMs) {
+        if (!monitoring) return;
+        handler.removeCallbacks(scanRunnable);
+        handler.postDelayed(scanRunnable, delayMs);
     }
 
     private boolean hasBluetoothPermissions() {
@@ -206,7 +258,7 @@ public class BluetoothWorkerService extends Service {
     }
 
     private boolean isTarget(String name) {
-        return name != null && TARGET_NAMES.contains(name.trim().toUpperCase(Locale.ROOT));
+        return name != null && name.toUpperCase(Locale.ROOT).contains("BT115");
     }
 
     private void updateStatus(String status) {
@@ -218,7 +270,7 @@ public class BluetoothWorkerService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "مراقبة ريموت BT115", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("حالة البحث عن ريموت Bluetooth المحدد");
+            channel.setDescription("البحث عن أجهزة Bluetooth التي يحتوي اسمها BT115");
             getSystemService(NotificationManager.class).createNotificationChannel(channel);
         }
     }
@@ -239,7 +291,12 @@ public class BluetoothWorkerService extends Service {
     }
 
     @Override public void onDestroy() {
-        scanLoop.stop();
+        monitoring = false;
+        handler.removeCallbacksAndMessages(null);
+        if (adapter != null) {
+            try { if (adapter.isDiscovering()) adapter.cancelDiscovery(); }
+            catch (SecurityException ignored) { }
+        }
         if (bluetoothReceiver != null) {
             try { unregisterReceiver(bluetoothReceiver); } catch (Exception ignored) { }
         }
@@ -248,39 +305,4 @@ public class BluetoothWorkerService extends Service {
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
-
-    private static final class CommandResult {
-        final boolean success;
-        final int exitCode;
-        final String output;
-        CommandResult(boolean success, int exitCode, String output) {
-            this.success = success;
-            this.exitCode = exitCode;
-            this.output = output == null ? "" : output;
-        }
-    }
-
-    private final class HandlerLoop {
-        private final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
-        private Runnable scanRunnable;
-        void runScanCycle(BluetoothAdapter adapter) {
-            scanRunnable = new Runnable() {
-                @Override public void run() {
-                    try {
-                        if (adapter.isEnabled()) {
-                            boolean started = adapter.startDiscovery();
-                            if (started) updateStatus("جارٍ البحث عن BT115-001 / BT115-002 / BT115-003.");
-                            else updateStatus("تعذر بدء البحث؛ سيعيد التطبيق المحاولة.");
-                        }
-                    } catch (SecurityException e) {
-                        updateStatus("منع Android البحث عن أجهزة Bluetooth.");
-                    }
-                    handler.postDelayed(this, 30000);
-                }
-            };
-            handler.removeCallbacks(scanRunnable);
-            handler.post(scanRunnable);
-        }
-        void stop() { if (scanRunnable != null) handler.removeCallbacks(scanRunnable); }
-    }
 }

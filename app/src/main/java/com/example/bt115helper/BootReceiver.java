@@ -16,8 +16,11 @@ public class BootReceiver extends BroadcastReceiver {
         try {
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(service);
             else context.startService(service);
-        } catch (RuntimeException ignored) {
-            // Android/OEM background-start restrictions may prevent boot startup.
+        } catch (RuntimeException error) {
+            context.getSharedPreferences(BluetoothWorkerService.PREFS, Context.MODE_PRIVATE)
+                    .edit().putString(BluetoothWorkerService.KEY_STATUS,
+                            "لم يسمح النظام ببدء المراقبة بعد الإقلاع: " + error.getClass().getSimpleName())
+                    .apply();
         }
     }
 }
