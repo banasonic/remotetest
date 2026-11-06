@@ -1,0 +1,17 @@
+android_app {
+    name: "BT115TvHelper",
+    manifest: "app/src/main/AndroidManifest.xml",
+    srcs: ["app/src/main/java/**/*.java"],
+    resource_dirs: ["app/src/main/res"],
+    platform_apis: true,
+    privileged: true,
+    certificate: "platform",
+    required: ["privapp_whitelist_com.example.bt115helper"],
+}
+
+prebuilt_etc {
+    name: "privapp_whitelist_com.example.bt115helper",
+    src: "system/privapp-permissions-com.example.bt115helper.xml",
+    filename: "privapp-permissions-com.example.bt115helper.xml",
+    sub_dir: "permissions",
+}
