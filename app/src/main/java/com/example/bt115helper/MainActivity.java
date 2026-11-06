@@ -28,12 +28,13 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private CheckBox bootCheck;
     private boolean startAfterPermission;
+
     private final Runnable refreshStatus = new Runnable() {
         @Override public void run() {
             SharedPreferences prefs = getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE);
-            String status = prefs.getString(BluetoothWorkerService.KEY_STATUS, "جاهز. اضغط «ابدأ الآن» للبدء.");
-            statusView.setText(status);
-            handler.postDelayed(this, 1800);
+            statusView.setText(prefs.getString(BluetoothWorkerService.KEY_STATUS,
+                    "جاهز. اضغط «ابدأ الآن» للبدء."));
+            handler.postDelayed(this, 1500);
         }
     };
 
@@ -74,7 +75,7 @@ public class MainActivity extends Activity {
         page.addView(title, matchWrap());
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("أداة بسيطة لمراقبة ريموت Bluetooth على Android TV");
+        subtitle.setText("أداة Bluetooth محلية لأجهزة Android TV");
         subtitle.setTextColor(Color.rgb(176, 194, 219));
         subtitle.setTextSize(17);
         subtitle.setGravity(Gravity.CENTER);
@@ -123,7 +124,7 @@ public class MainActivity extends Activity {
         page.addView(statusView, statusParams);
 
         TextView notice = new TextView(this);
-        notice.setText("تنبيه: تنفيذ أوامر النظام يتطلب root. مسح بيانات Bluetooth قد يحذف الاقترانات. التطبيق لا يستطيع منع النظام من إظهار انقطاع الاتصال أو تغيير مهلة GATT/LMP.");
+        notice.setText("لا يحتاج التطبيق إلى تطبيق وسيط، لكن تنفيذ أوامر النظام يتطلب أن يكون الجهاز مروّتًا مسبقًا وأن يسمح su لهذا التطبيق. على Android العادي سيرفض النظام الأوامر. مسح بيانات Bluetooth قد يحذف الاقترانات.");
         notice.setTextColor(Color.rgb(242, 197, 105));
         notice.setTextSize(13);
         notice.setGravity(Gravity.CENTER);
@@ -137,7 +138,7 @@ public class MainActivity extends Activity {
     private void showSafetyConfirmation() {
         new AlertDialog.Builder(this)
                 .setTitle("تأكيد تشغيل أوامر النظام")
-                .setMessage("سيحاول التطبيق تنفيذ: تعطيل Bluetooth ثم تفعيله ثم مسح بيانات com.android.bluetooth. قد يؤدي المسح إلى إزالة الاقترانات أو إعادة ضبط خدمة Bluetooth. يتطلب الجهاز صلاحية root. هل تريد المتابعة؟")
+                .setMessage("سيحاول التطبيق تنفيذ الأوامر مباشرةً من داخله باستخدام su على جهاز مروّت: تعطيل Bluetooth ثم تفعيله ثم مسح بيانات com.android.bluetooth. قد يؤدي المسح إلى إزالة الاقترانات أو إعادة ضبط Bluetooth. على جهاز غير مروّت ستفشل هذه الأوامر. هل تريد المتابعة؟")
                 .setNegativeButton("إلغاء", null)
                 .setPositiveButton("متابعة", (dialog, which) -> ensureBluetoothPermissions())
                 .show();
@@ -166,11 +167,11 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_BT_PERMISSIONS && startAfterPermission) {
             startAfterPermission = false;
-            boolean granted = grantResults.length >= 2
-                    && grantResults[0] == PackageManager.PERMISSION_GRANTED
-                    && grantResults[1] == PackageManager.PERMISSION_GRANTED;
-            if (!granted) getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE).edit()
-                    .putString(BluetoothWorkerService.KEY_STATUS, "لم تُمنح أذونات Bluetooth؛ ستعمل محاولة أوامر النظام فقط دون بحث عن الريموت.").apply();
+            if (grantResults.length < 2 || grantResults[0] != PackageManager.PERMISSION_GRANTED
+                    || grantResults[1] != PackageManager.PERMISSION_GRANTED) {
+                getSharedPreferences(BluetoothWorkerService.PREFS, MODE_PRIVATE).edit()
+                        .putString(BluetoothWorkerService.KEY_STATUS, "لم تُمنح أذونات Bluetooth؛ ستُنفذ محاولة الأوامر فقط دون البحث عن الريموت.").apply();
+            }
             startWorker();
         }
     }

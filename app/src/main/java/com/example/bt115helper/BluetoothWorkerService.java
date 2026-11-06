@@ -11,7 +11,6 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -60,72 +59,62 @@ public class BluetoothWorkerService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIFICATION_ID, buildNotification("يتم تشغيل خدمة المراقبة"));
-        if (!busy) {
-            busy = true;
-            String action = intent == null ? null : intent.getAction();
-            boolean runCommands = ACTION_RUN_NOW.equals(action) || ACTION_BOOT.equals(action);
-            worker.execute(() -> {
-                try {
-                    if (runCommands) {
-                        runRequestedSequence();
-                        updateStatus("تم تنفيذ المحاولات. جارٍ البحث عن ريموت BT115.");
-                    }
-                    beginMonitoring();
-                } finally {
-                    busy = false;
-                }
-            });
-        }
+        startForeground(NOTIFICATION_ID, buildNotification("يتم تشغيل الخدمة"));
+        if (busy) return START_STICKY;
+        busy = true;
+        String action = intent == null ? null : intent.getAction();
+        boolean runCommands = ACTION_RUN_NOW.equals(action) || ACTION_BOOT.equals(action);
+        worker.execute(() -> {
+            try {
+                if (runCommands) runRequestedSequence();
+                beginMonitoring();
+            } finally {
+                busy = false;
+            }
+        });
         return START_STICKY;
     }
 
     private void runRequestedSequence() {
         for (int i = 0; i < COMMANDS.length; i++) {
             String command = COMMANDS[i];
-            updateStatus("تنفيذ " + (i + 1) + "/3: " + command);
-            CommandResult result = runPrivilegedOrSystem(command);
-            Log.i(TAG, command + " => " + result.describe());
+            updateStatus("تنفيذ مباشر عبر su " + (i + 1) + "/3: " + command);
+            CommandResult result = executeAsRoot(command);
+            Log.i(TAG, command + " => " + result.output);
             if (result.success) {
                 updateStatus("نجح الأمر " + (i + 1) + "/3: " + command);
             } else {
-                updateStatus("تعذر الأمر " + (i + 1) + "/3. يلزم root أو دمج التطبيق وتوقيعه كتطبيق نظام. " + shortText(result.describe()));
+                updateStatus("فشل الأمر " + (i + 1) + "/3 (exit " + result.exitCode + "): " + shortText(result.output));
             }
-            try { Thread.sleep(i == 1 ? 3500 : 700); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            try { Thread.sleep(i == 1 ? 3500 : 700); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
         }
     }
 
-    private CommandResult runPrivilegedOrSystem(String command) {
-        CommandResult rootResult = execute(new String[]{"su", "-c", command});
-        if (rootResult.success) return rootResult;
-        CommandResult systemResult = execute(new String[]{"/system/bin/sh", "-c", command});
-        if (systemResult.success) return new CommandResult(true, "نفذ ضمن سياق النظام: " + systemResult.output);
-        return new CommandResult(false, "su: " + shortText(rootResult.describe()) + " | system: " + shortText(systemResult.describe()));
-    }
-
-    private CommandResult execute(String[] args) {
+    private CommandResult executeAsRoot(String command) {
         Process process = null;
         ExecutorService readerExecutor = Executors.newSingleThreadExecutor();
         try {
-            process = new ProcessBuilder(args).redirectErrorStream(true).start();
+            process = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
             final InputStream stream = process.getInputStream();
             Future<String> outputFuture = readerExecutor.submit((Callable<String>) () -> {
                 ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 byte[] buffer = new byte[2048];
                 int count;
                 while ((count = stream.read(buffer)) != -1) bytes.write(buffer, 0, count);
-                return new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+                return new String(bytes.toByteArray(), StandardCharsets.UTF_8).trim();
             });
-            boolean finished = process.waitFor(12, TimeUnit.SECONDS);
-            if (!finished) {
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
-                return new CommandResult(false, "انتهت مهلة التنفيذ (12 ثانية)");
+                return new CommandResult(false, 124, "انتهت مهلة الأمر بعد 20 ثانية");
             }
-            String output = outputFuture.get(2, TimeUnit.SECONDS).trim();
-            return new CommandResult(process.exitValue() == 0, output.isEmpty() ? "exit=" + process.exitValue() : output + " (exit=" + process.exitValue() + ")");
+            String output = outputFuture.get(3, TimeUnit.SECONDS);
+            int exitCode = process.exitValue();
+            return new CommandResult(exitCode == 0, exitCode, output.isEmpty() ? "لا توجد مخرجات" : output);
         } catch (Exception e) {
             if (process != null) process.destroyForcibly();
-            return new CommandResult(false, e.getClass().getSimpleName() + ": " + e.getMessage());
+            return new CommandResult(false, 125,
+                    "تعذر تشغيل su أو لم يمنح الجهاز صلاحية root: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         } finally {
             readerExecutor.shutdownNow();
         }
@@ -133,7 +122,7 @@ public class BluetoothWorkerService extends Service {
 
     private void beginMonitoring() {
         if (!hasBluetoothPermissions()) {
-            updateStatus("أوامر النظام انتهت؛ البحث يحتاج إذن Bluetooth من واجهة التطبيق أولًا.");
+            updateStatus("لم تُمنح أذونات Bluetooth؛ لم يبدأ البحث عن الريموت.");
             return;
         }
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
@@ -143,7 +132,7 @@ public class BluetoothWorkerService extends Service {
         }
         try {
             if (!adapter.isEnabled()) {
-                updateStatus("Bluetooth غير مفعّل. تحقق من نتيجة cmd bluetooth_manager enable.");
+                updateStatus("Bluetooth غير مفعّل. راجع نتيجة أمر enable أعلاه.");
                 return;
             }
             checkBondedDevices(adapter);
@@ -262,9 +251,13 @@ public class BluetoothWorkerService extends Service {
 
     private static final class CommandResult {
         final boolean success;
+        final int exitCode;
         final String output;
-        CommandResult(boolean success, String output) { this.success = success; this.output = output == null ? "" : output; }
-        String describe() { return output; }
+        CommandResult(boolean success, int exitCode, String output) {
+            this.success = success;
+            this.exitCode = exitCode;
+            this.output = output == null ? "" : output;
+        }
     }
 
     private final class HandlerLoop {
